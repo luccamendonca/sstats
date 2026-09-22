@@ -49,6 +49,11 @@ class StatusBarController {
         previousNet = currentNet
         previousTime = now
 
-        statusItem.button?.title = "\(cpuStr)  \(memStr)  \(netStr)"
+        let text = "\(cpuStr)  \(memStr)  \(netStr)"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.white,
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+        ]
+        statusItem.button?.attributedTitle = NSAttributedString(string: text, attributes: attrs)
     }
 }

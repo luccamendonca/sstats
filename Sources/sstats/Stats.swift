@@ -63,11 +63,11 @@ func memoryUsagePercent() -> Double {
     guard result == KERN_SUCCESS else { return 0 }
 
     let pageSize = Double(vm_kernel_page_size)
-    let active = Double(stats.active_count) * pageSize
+    let appMemory = Double(stats.internal_page_count - stats.purgeable_count) * pageSize
     let wired = Double(stats.wire_count) * pageSize
     let compressed = Double(stats.compressor_page_count) * pageSize
+    let used = appMemory + wired + compressed
 
-    let used = active + wired + compressed
     return used / totalBytes * 100.0
 }
 
@@ -76,9 +76,76 @@ struct NetworkBytes {
     var bytesOut: UInt64 = 0
 }
 
-/// Uses sysctl NET_RT_IFLIST2 to get 64-bit byte counters (if_data64)
-/// instead of getifaddrs which only exposes 32-bit counters that wrap at ~4GB.
+/// Reads cumulative network bytes via `nettop -m route`, which is backed by the
+/// kernel's ntstat subsystem.  Unlike `sysctl NET_RT_IFLIST2`, this source is
+/// updated by the Skywalk inbound path on Apple Silicon, so `bytesIn` correctly
+/// reflects received traffic.
+///
+/// Falls back to `readNetworkBytesSysctl()` if nettop cannot be launched.
 func readNetworkBytes() -> NetworkBytes {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+    // -l 1     : one snapshot (cumulative counters, not deltas)
+    // -m route : route-level stats backed by ntstat (works on Skywalk / Apple Silicon)
+    // -n       : skip DNS resolution (faster startup)
+    // -P       : process-summary rows only, no per-connection detail
+    // -x       : extended numeric output — no "MiB"/"GiB" suffixes
+    task.arguments = ["-l", "1", "-m", "route", "-n", "-P", "-x"]
+
+    let outPipe = Pipe()
+    task.standardOutput = outPipe
+    task.standardError = Pipe()
+
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return readNetworkBytesSysctl()
+    }
+
+    guard
+        let output = String(
+            data: outPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )
+    else {
+        return readNetworkBytesSysctl()
+    }
+
+    // Each data line format (space-padded columns):
+    //   HH:MM:SS.usec  dest -> iface [-> gateway]   bytes_in   bytes_out  ...
+    //
+    // Route-description tokens contain "->", interface names, and IP/IPv6
+    // addresses (which include ".", ":", "/", "%" or letters) — none of which
+    // parse as a plain decimal UInt64.  The first two tokens that DO parse as
+    // UInt64 are bytes_in and bytes_out.  The header row and the trailing
+    // "N.NN ms" columns are also skipped naturally by this rule.
+    var result = NetworkBytes()
+    for line in output.split(separator: "\n") {
+        let str = String(line)
+        guard !str.contains("-> lo0") else { continue }  // skip loopback
+
+        var nums: [UInt64] = []
+        for token in str.split(separator: " ", omittingEmptySubsequences: true) {
+            if let n = UInt64(token) {
+                nums.append(n)
+                if nums.count == 2 { break }
+            }
+        }
+        if nums.count == 2 {
+            result.bytesIn += nums[0]
+            result.bytesOut += nums[1]
+        }
+    }
+    return result
+}
+
+/// Fallback network-byte reader using `sysctl NET_RT_IFLIST2` (if_data64).
+///
+/// - Warning: On Apple Silicon (Skywalk), `ifi_ibytes` is **not** updated by
+///   the hardware inbound path, so `bytesIn` will always appear stale.
+///   Use `readNetworkBytes()` instead.
+private func readNetworkBytesSysctl() -> NetworkBytes {
     var result = NetworkBytes()
 
     var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
@@ -99,7 +166,6 @@ func readNetworkBytes() -> NetworkBytes {
                 .withMemoryRebound(to: if_msghdr.self, capacity: 1) { $0.pointee }
         }
         guard hdr.ifm_msglen > 0 else { break }
-
         if Int32(hdr.ifm_type) == RTM_IFINFO2 {
             buf.withUnsafeBufferPointer { ptr in
                 ptr.baseAddress!.advanced(by: offset)
@@ -112,7 +178,6 @@ func readNetworkBytes() -> NetworkBytes {
                     }
             }
         }
-
         offset += Int(hdr.ifm_msglen)
     }
 
